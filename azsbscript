@@ -34,8 +34,17 @@ function Load-Settings {
             $json = Get-Content $script:SettingsPath -Raw | ConvertFrom-Json
             $settings = [ordered]@{}
             foreach ($key in $script:DefaultSettings.Keys) {
-                if ($null -ne $json.$key) { $settings[$key] = $json.$key }
-                else { $settings[$key] = $script:DefaultSettings[$key] }
+                $default = $script:DefaultSettings[$key]
+                $val = $json.$key
+                if ($null -eq $val) {
+                    $settings[$key] = $default
+                } elseif ($default -is [int]) {
+                    $settings[$key] = [int]$val
+                } elseif ($default -is [bool]) {
+                    $settings[$key] = [bool]$val
+                } else {
+                    $settings[$key] = [string]$val
+                }
             }
             return $settings
         } catch {
@@ -46,12 +55,12 @@ function Load-Settings {
 }
 
 function Save-Settings {
-    param([ordered]$Settings)
+    param($Settings)
     $Settings | ConvertTo-Json -Depth 3 | Set-Content $script:SettingsPath -Encoding UTF8
 }
 
 function Show-SettingsMenu {
-    param([ordered]$Settings)
+    param($Settings)
     while ($true) {
         Write-Host ""
         Write-Host "  ── Settings ──" -ForegroundColor Cyan
@@ -157,7 +166,7 @@ function Get-EntityPath {
     param([PSObject]$Entry, [bool]$IsDlq)
     $path = if ($Entry.Type -eq 'Queue') { $Entry.Entity }
             else { "$($Entry.Entity)/Subscriptions/$($Entry.Subscription)" }
-    if ($IsDlq) { $path += '/`$deadletterqueue' }
+    if ($IsDlq) { $path += '/$deadletterqueue' }
     return $path
 }
 
@@ -170,12 +179,10 @@ function Parse-MessageResponse {
         $brokerProps = $Response.Headers['BrokerProperties'] | ConvertFrom-Json
     }
     $customProps = @{}
-    $skipHeaders = [System.Collections.Generic.HashSet[string]]::new(
-        [StringComparer]::OrdinalIgnoreCase)
-    @('BrokerProperties','Content-Type','Content-Length','Server','Transfer-Encoding',
-      'Date','Strict-Transport-Security','Connection') | ForEach-Object { $skipHeaders.Add($_) | Out-Null }
+    $skipHeaders = @('BrokerProperties','Content-Type','Content-Length','Server',
+                     'Transfer-Encoding','Date','Strict-Transport-Security','Connection')
     foreach ($h in $Response.Headers.Keys) {
-        if (-not $skipHeaders.Contains($h) -and $h -notlike 'x-ms-*') {
+        if ($h -notin $skipHeaders -and $h -notlike 'x-ms-*') {
             $customProps[$h] = $Response.Headers[$h]
         }
     }
@@ -329,18 +336,18 @@ function Should-ReportProgress {
 # ── Scanning ─────────────────────────────────────────────────────────────
 
 function Invoke-Scan {
-    param([ordered]$Settings)
+    param($Settings)
     $nsArgs = @('servicebus', 'namespace', 'list', '--output', 'json')
     if ($Settings.ResourceGroupFilter) {
         $nsArgs += '--resource-group', $Settings.ResourceGroupFilter
     }
-    $namespaces = az @nsArgs | ConvertFrom-Json
+    $namespaces = @(az @nsArgs | ConvertFrom-Json)
 
     if ($Settings.NamespaceFilter) {
-        $namespaces = $namespaces | Where-Object { $_.name -like "*$($Settings.NamespaceFilter)*" }
+        $namespaces = @($namespaces | Where-Object { $_.name -like "*$($Settings.NamespaceFilter)*" })
     }
 
-    if (-not $namespaces -or @($namespaces).Count -eq 0) {
+    if ($namespaces.Count -eq 0) {
         Write-Warning "No Service Bus namespaces found matching filters."
         return $null
     }
@@ -353,7 +360,7 @@ function Invoke-Scan {
         $rg = $ns.resourceGroup
         Write-Host "  Scanning $nsName..." -ForegroundColor DarkGray
 
-        $queues = az servicebus queue list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-Json
+        $queues = @(az servicebus queue list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-Json)
         foreach ($q in $queues) {
             $dlq    = [int]$q.countDetails.deadLetterMessageCount
             $active = [int]$q.countDetails.activeMessageCount
@@ -372,9 +379,9 @@ function Invoke-Scan {
             }
         }
 
-        $topics = az servicebus topic list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-Json
+        $topics = @(az servicebus topic list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-Json)
         foreach ($t in $topics) {
-            $subs = az servicebus topic subscription list --namespace-name $nsName --resource-group $rg --topic-name $t.name --output json 2>$null | ConvertFrom-Json
+            $subs = @(az servicebus topic subscription list --namespace-name $nsName --resource-group $rg --topic-name $t.name --output json 2>$null | ConvertFrom-Json)
             foreach ($s in $subs) {
                 $dlq    = [int]$s.countDetails.deadLetterMessageCount
                 $active = [int]$s.countDetails.activeMessageCount
@@ -443,7 +450,7 @@ function Invoke-SafePeekAll {
         [scriptblock]$OnMessage,     # receives ($msg, $index)
         [string]$ActivityLabel
     )
-    $seen = [System.Collections.Generic.HashSet[long]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new()
     $duplicatesInARow = 0
     $maxDuplicates = [Math]::Max(10, [Math]::Ceiling($ExpectedCount * 0.1))
     $errors = 0
@@ -466,8 +473,9 @@ function Invoke-SafePeekAll {
 
         if (-not $msg) { break }
 
-        $seq = $msg.BrokerProperties.SequenceNumber
-        if ($seq -and -not $seen.Add($seq)) {
+        # SequenceNumber can arrive as int, long, or string from ConvertFrom-Json — use string for safe comparison
+        $seq = [string]$msg.BrokerProperties.SequenceNumber
+        if ($seq -and $seq -ne '' -and -not $seen.Add($seq)) {
             # Duplicate — lock expired and we re-peeked a message we already saw
             $duplicatesInARow++
             if ($msg.LockUri) { Unlock-Message -LockUri $msg.LockUri -SasToken $sasToken }
@@ -520,8 +528,8 @@ $script:Settings = Load-Settings
 $script:SasCache = @{}
 
 # ── Subscription selection ──
-$subscriptions = az account list --output json --query "[?state=='Enabled']" | ConvertFrom-Json
-if (-not $subscriptions -or $subscriptions.Count -eq 0) {
+$subscriptions = @(az account list --output json --query "[?state=='Enabled']" | ConvertFrom-Json)
+if ($subscriptions.Count -eq 0) {
     Write-Error "No enabled Azure subscriptions found. Run 'az login' first."
     return
 }
@@ -562,7 +570,10 @@ Write-AuditLog "Session started — subscription: $($current.name) ($($current.i
 # ── Initial scan ──
 Write-Host ""
 $results = Invoke-Scan -Settings $script:Settings
-if (-not $results) { return }
+if (-not $results -or $results.Count -eq 0) {
+    Write-Host "  No entities to display. Adjust settings or check your subscription." -ForegroundColor DarkGray
+    return
+}
 Show-ResultsTable $results
 
 # ── Key cache ──
@@ -586,7 +597,8 @@ while ($true) {
         Show-SettingsMenu $script:Settings
         Write-Host "  Rescanning with new filters..." -ForegroundColor Yellow
         $results = Invoke-Scan -Settings $script:Settings
-        if ($results) { Show-ResultsTable $results }
+        if ($results -and $results.Count -gt 0) { Show-ResultsTable $results }
+        else { Write-Host "  No entities found." -ForegroundColor DarkGray }
         continue
     }
 
@@ -594,7 +606,8 @@ while ($true) {
     if ($input_ -in @('r','R')) {
         Write-Host "  Rescanning..." -ForegroundColor Yellow
         $results = Invoke-Scan -Settings $script:Settings
-        if ($results) { Show-ResultsTable $results }
+        if ($results -and $results.Count -gt 0) { Show-ResultsTable $results }
+        else { Write-Host "  No entities found." -ForegroundColor DarkGray }
         continue
     }
 
@@ -628,7 +641,7 @@ while ($true) {
                 -ExpectedCount $entry.DLQMessages -ActivityLabel "Exporting $desc DLQ" -OnMessage {
                     param($m, $i)
                     $rows.Add((ConvertTo-ExcelRow -Message $m -Index $i))
-                }
+                }.GetNewClosure()
 
             if ($rows.Count -gt 0) {
                 $fp = Export-MessagesToExcel -Rows $rows -Entry $entry -Source 'DLQ'
@@ -728,7 +741,7 @@ while ($true) {
                 }
                 $preview = Format-BodyPreview -Body $m.Body -MaxChars $maxChars
                 Write-Host $preview
-            }
+            }.GetNewClosure()
 
         Write-Host "`n  Peeked $peeked message(s)." -ForegroundColor Green
         continue
@@ -749,7 +762,7 @@ while ($true) {
             -ExpectedCount $total -ActivityLabel "Exporting $sourceLabel" -OnMessage {
                 param($m, $i)
                 $rows.Add((ConvertTo-ExcelRow -Message $m -Index $i))
-            }
+            }.GetNewClosure()
 
         if ($rows.Count -gt 0) {
             $fp = Export-MessagesToExcel -Rows $rows -Entry $entry -Source $sourceLabel
