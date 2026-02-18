@@ -663,8 +663,7 @@ while ($true) {
                 -ExpectedCount $entry.DLQMessages -ActivityLabel "Exporting $desc DLQ" -OnMessage {
                     param($m, $i)
                     $rows.Add((ConvertTo-ExcelRow -Message $m -Index $i))
-                }.GetNewClosure()
-
+                }
             if ($rows.Count -gt 0) {
                 $fp = Export-MessagesToExcel -Rows $rows -Entry $entry -Source 'DLQ'
                 Write-Host "    -> $fp [$($rows.Count) messages]" -ForegroundColor Green
@@ -763,8 +762,7 @@ while ($true) {
                 }
                 $preview = Format-BodyPreview -Body $m.Body -MaxChars $maxChars
                 Write-Host $preview
-            }.GetNewClosure()
-
+            }
         Write-Host "`n  Peeked $peeked message(s)." -ForegroundColor Green
         continue
     }
@@ -784,8 +782,7 @@ while ($true) {
             -ExpectedCount $total -ActivityLabel "Exporting $sourceLabel" -OnMessage {
                 param($m, $i)
                 $rows.Add((ConvertTo-ExcelRow -Message $m -Index $i))
-            }.GetNewClosure()
-
+            }
         if ($rows.Count -gt 0) {
             $fp = Export-MessagesToExcel -Rows $rows -Entry $entry -Source $sourceLabel
             $el = $sw.Elapsed.ToString('mm\:ss')
