@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Interactive Service Bus message explorer — view, export, resubmit, and purge
+    Interactive Service Bus message explorer - view, export, resubmit, and purge
     messages from queues, topic subscriptions, and their dead-letter queues.
 .DESCRIPTION
     Uses Az CLI with the current login context.
@@ -51,7 +51,11 @@ function Load-Settings {
             Write-Warning "Could not load settings, using defaults."
         }
     }
-    return $script:DefaultSettings.Clone()
+    $copy = [ordered]@{}
+    foreach ($key in $script:DefaultSettings.Keys) {
+        $copy[$key] = $script:DefaultSettings[$key]
+    }
+    return $copy
 }
 
 function Save-Settings {
@@ -63,7 +67,7 @@ function Show-SettingsMenu {
     param($Settings)
     while ($true) {
         Write-Host ""
-        Write-Host "  ── Settings ──" -ForegroundColor Cyan
+        Write-Host "  -- Settings --" -ForegroundColor Cyan
         Write-Host "  [1] Resource Group filter : $(if ($Settings.ResourceGroupFilter) { $Settings.ResourceGroupFilter } else { '(all)' })"
         Write-Host "  [2] Namespace filter      : $(if ($Settings.NamespaceFilter) { $Settings.NamespaceFilter } else { '(all)' })"
         Write-Host "  [3] Min DLQ count         : $($Settings.MinDlqCount)"
@@ -158,6 +162,24 @@ function Get-NamespaceKeys {
     $keys = az servicebus namespace authorization-rule keys list `
         --namespace-name $Namespace --resource-group $Rg --name $rule.name --output json | ConvertFrom-Json
     return @{ KeyName = $rule.name; PrimaryKey = $keys.primaryKey }
+}
+
+# ── JSON Array Helper ─────────────────────────────────────────────────────
+# ConvertFrom-Json in PS 5.1 outputs a JSON array as a single Object[].
+# Wrapping with @() nests it instead of flattening. This helper ensures
+# the result is always a flat, indexable array.
+
+function ConvertFrom-JsonArray {
+    param([Parameter(ValueFromPipeline)][string[]]$Json)
+    begin { $lines = [System.Collections.Generic.List[string]]::new() }
+    process { foreach ($l in $Json) { $lines.Add($l) } }
+    end {
+        if ($lines.Count -eq 0) { return ,@() }
+        $parsed = ($lines -join "`n") | ConvertFrom-Json
+        if ($null -eq $parsed) { return ,@() }
+        if ($parsed -is [System.Array]) { return ,$parsed }
+        return ,@($parsed)
+    }
 }
 
 # ── Entity Path Builders ─────────────────────────────────────────────────
@@ -341,7 +363,7 @@ function Invoke-Scan {
     if ($Settings.ResourceGroupFilter) {
         $nsArgs += '--resource-group', $Settings.ResourceGroupFilter
     }
-    $namespaces = @(az @nsArgs | ConvertFrom-Json)
+    $namespaces = az @nsArgs | ConvertFrom-JsonArray
 
     if ($Settings.NamespaceFilter) {
         $namespaces = @($namespaces | Where-Object { $_.name -like "*$($Settings.NamespaceFilter)*" })
@@ -360,7 +382,7 @@ function Invoke-Scan {
         $rg = $ns.resourceGroup
         Write-Host "  Scanning $nsName..." -ForegroundColor DarkGray
 
-        $queues = @(az servicebus queue list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-Json)
+        $queues = az servicebus queue list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-JsonArray
         foreach ($q in $queues) {
             $dlq    = [int]$q.countDetails.deadLetterMessageCount
             $active = [int]$q.countDetails.activeMessageCount
@@ -379,9 +401,9 @@ function Invoke-Scan {
             }
         }
 
-        $topics = @(az servicebus topic list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-Json)
+        $topics = az servicebus topic list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-JsonArray
         foreach ($t in $topics) {
-            $subs = @(az servicebus topic subscription list --namespace-name $nsName --resource-group $rg --topic-name $t.name --output json 2>$null | ConvertFrom-Json)
+            $subs = az servicebus topic subscription list --namespace-name $nsName --resource-group $rg --topic-name $t.name --output json 2>$null | ConvertFrom-JsonArray
             foreach ($s in $subs) {
                 $dlq    = [int]$s.countDetails.deadLetterMessageCount
                 $active = [int]$s.countDetails.activeMessageCount
@@ -408,9 +430,9 @@ function Invoke-Scan {
     Write-Host ""
     Write-Host "  Found $($results.Count) entities across $nsCount namespace(s)" -NoNewline -ForegroundColor Cyan
     if ($dlqRows -gt 0) {
-        Write-Host " — $dlqRows with DLQ messages ($totalDlq total dead-lettered)" -ForegroundColor Yellow
+        Write-Host " - $dlqRows with DLQ messages, $totalDlq total dead-lettered" -ForegroundColor Yellow
     } else {
-        Write-Host " — no dead-lettered messages" -ForegroundColor Green
+        Write-Host " - no dead-lettered messages" -ForegroundColor Green
     }
 
     return $results
@@ -426,7 +448,7 @@ function Show-ResultsTable {
     # Colorized table: highlight rows with DLQ > 0
     $fmt = "{0,5} {1,-30} {2,-10} {3,-30} {4,-20} {5,8} {6,8}"
     Write-Host ($fmt -f 'Index','Namespace','Type','Entity','Subscription','Active','DLQ') -ForegroundColor White
-    Write-Host ($fmt -f '-----','─────────','────','──────','────────────','──────','───') -ForegroundColor DarkGray
+    Write-Host ($fmt -f '-----','---------','----','------','------------','------','---') -ForegroundColor DarkGray
     foreach ($r in ($Results | Sort-Object DLQMessages -Descending)) {
         $color = if ($r.DLQMessages -gt 0) { 'Yellow' } else { 'Gray' }
         Write-Host ($fmt -f $r.Index, $r.Namespace, $r.Type, $r.Entity, $r.Subscription, $r.ActiveMessages, $r.DLQMessages) -ForegroundColor $color
@@ -473,10 +495,10 @@ function Invoke-SafePeekAll {
 
         if (-not $msg) { break }
 
-        # SequenceNumber can arrive as int, long, or string from ConvertFrom-Json — use string for safe comparison
+        # SequenceNumber can arrive as int, long, or string from ConvertFrom-Json - use string for safe comparison
         $seq = [string]$msg.BrokerProperties.SequenceNumber
         if ($seq -and $seq -ne '' -and -not $seen.Add($seq)) {
-            # Duplicate — lock expired and we re-peeked a message we already saw
+            # Duplicate - lock expired and we re-peeked a message we already saw
             $duplicatesInARow++
             if ($msg.LockUri) { Unlock-Message -LockUri $msg.LockUri -SasToken $sasToken }
             if ($duplicatesInARow -ge $maxDuplicates) {
@@ -528,7 +550,7 @@ $script:Settings = Load-Settings
 $script:SasCache = @{}
 
 # ── Subscription selection ──
-$subscriptions = @(az account list --output json --query "[?state=='Enabled']" | ConvertFrom-Json)
+$subscriptions = az account list --output json --query "[?state=='Enabled']" | ConvertFrom-JsonArray
 if ($subscriptions.Count -eq 0) {
     Write-Error "No enabled Azure subscriptions found. Run 'az login' first."
     return
@@ -565,7 +587,7 @@ if ($subChoice -ne '') {
 Write-Host ""
 Write-Host "  Subscription: $($current.name)" -ForegroundColor Cyan
 Write-Host "  $($current.id)" -ForegroundColor DarkGray
-Write-AuditLog "Session started — subscription: $($current.name) ($($current.id))"
+Write-AuditLog "Session started - subscription: $($current.name) [$($current.id)]"
 
 # ── Initial scan ──
 Write-Host ""
@@ -634,7 +656,7 @@ while ($true) {
 
             $rows = [System.Collections.Generic.List[PSObject]]::new()
             $desc = if ($entry.Type -eq 'Queue') { $entry.Entity } else { "$($entry.Entity)/$($entry.Subscription)" }
-            Write-Host "  $desc ($($entry.DLQMessages) DLQ)..." -ForegroundColor DarkGray
+            Write-Host "  $desc - $($entry.DLQMessages) DLQ..." -ForegroundColor DarkGray
 
             $sasToken = Get-SasTokenCached -BaseUri $baseUri -Keys $script:CurrentKeys
             $null = Invoke-SafePeekAll -BaseUri $baseUri -EntityPath $entityPath -SasToken $sasToken `
@@ -645,8 +667,8 @@ while ($true) {
 
             if ($rows.Count -gt 0) {
                 $fp = Export-MessagesToExcel -Rows $rows -Entry $entry -Source 'DLQ'
-                Write-Host "    -> $fp ($($rows.Count) messages)" -ForegroundColor Green
-                Write-AuditLog "Batch export: $desc DLQ — $($rows.Count) messages -> $fp"
+                Write-Host "    -> $fp [$($rows.Count) messages]" -ForegroundColor Green
+                Write-AuditLog "Batch export: $desc DLQ - $($rows.Count) messages -> $fp"
             }
         }
         continue
@@ -672,8 +694,8 @@ while ($true) {
 
     # ── Choose target ──
     Write-Host ""
-    Write-Host "  [1] Dead-letter queue ($($entry.DLQMessages) messages)"
-    Write-Host "  [2] Active queue ($($entry.ActiveMessages) messages)"
+    Write-Host "  [1] Dead-letter queue - $($entry.DLQMessages) messages"
+    Write-Host "  [2] Active queue - $($entry.ActiveMessages) messages"
     $targetChoice = Read-Host "  Target"
     $isDlq = $true
     $messageCount = $entry.DLQMessages
@@ -729,7 +751,7 @@ while ($true) {
             -SasToken (Get-SasTokenCached -BaseUri $baseUri -Keys $script:CurrentKeys) `
             -ExpectedCount $total -ActivityLabel "Peeking $sourceLabel" -OnMessage {
                 param($m, $i)
-                Write-Host "`n  ── Message $i / $total ──" -ForegroundColor DarkYellow
+                Write-Host "`n  -- Message $i / $total --" -ForegroundColor DarkYellow
                 if ($m.BrokerProperties) {
                     $bp = $m.BrokerProperties
                     Write-Host "  MessageId : $($bp.MessageId)" -ForegroundColor Gray
@@ -768,7 +790,7 @@ while ($true) {
             $fp = Export-MessagesToExcel -Rows $rows -Entry $entry -Source $sourceLabel
             $el = $sw.Elapsed.ToString('mm\:ss')
             Write-Host "  Exported $($rows.Count) messages in $el to: $fp" -ForegroundColor Green
-            Write-AuditLog "Export: $desc $sourceLabel — $($rows.Count) messages -> $fp"
+            Write-AuditLog "Export: $desc $sourceLabel - $($rows.Count) messages -> $fp"
         } else {
             Write-Warning "  No messages exported."
         }
@@ -780,7 +802,7 @@ while ($true) {
     if ($script:Settings.AutoExportBeforeDestructive) {
         if (Assert-ImportExcel) { $hasExcel = $true }
         else {
-            Write-Warning "  ImportExcel not available — no backup will be saved."
+            Write-Warning "  ImportExcel not available - no backup will be saved."
             $skip = Read-Host "  Continue without backup? (Y/N)"
             if ($skip -notin @('Y','y')) {
                 Write-Host "  Cancelled." -ForegroundColor DarkGray
@@ -819,7 +841,7 @@ while ($true) {
     $excelRows  = [System.Collections.Generic.List[PSObject]]::new()
     $sw         = [System.Diagnostics.Stopwatch]::StartNew()
 
-    Write-AuditLog "BEGIN $verbDisplay : $desc $sourceLabel — $total messages"
+    Write-AuditLog "BEGIN $verbDisplay : $desc $sourceLabel - $total messages"
 
     for ($i = 0; $i -lt $maxMsgs; $i++) {
         $sasToken = Get-SasTokenCached -BaseUri $baseUri -Keys $script:CurrentKeys
@@ -869,13 +891,13 @@ while ($true) {
     if ($hasExcel -and $excelRows.Count -gt 0) {
         $fp = Export-MessagesToExcel -Rows $excelRows -Entry $entry -Source $sourceLabel
         Write-Host "  Backup saved: $fp" -ForegroundColor Green
-        Write-AuditLog "Backup saved: $fp ($($excelRows.Count) messages)"
+        Write-AuditLog "Backup saved: $fp [$($excelRows.Count) messages]"
     }
 
     $verbPast = if ($action -in @('R','r')) { 'resubmitted' } else { 'deleted' }
     $el = $sw.Elapsed.ToString('mm\:ss')
     Write-Host "  Done: $processed messages $verbPast in $el." -ForegroundColor Green
-    Write-AuditLog "END $verbDisplay : $desc $sourceLabel — $processed $verbPast, $errors errors"
+    Write-AuditLog "END $verbDisplay : $desc $sourceLabel - $processed $verbPast, $errors errors"
 }
 
 Write-Host "Bye!" -ForegroundColor Cyan
