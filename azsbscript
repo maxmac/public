@@ -1,0 +1,95 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Lists dead-letter queue (DLQ) message counts for all Service Bus queues and topic subscriptions
+    in the currently selected Azure subscription.
+.DESCRIPTION
+    Uses Az CLI with the current login context. Iterates over every Service Bus namespace found,
+    then queries queues and topic subscriptions for their DLQ message counts.
+.EXAMPLE
+    .\Get-ServiceBusDLQ.ps1
+    .\Get-ServiceBusDLQ.ps1 -ResourceGroup my-rg
+    .\Get-ServiceBusDLQ.ps1 -MinDlqCount 1
+#>
+param(
+    [string]$ResourceGroup,
+    [int]$MinDlqCount = 0
+)
+
+$ErrorActionPreference = 'Stop'
+
+# Verify az cli is available
+if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+    Write-Error "Azure CLI (az) is not installed or not in PATH."
+    return
+}
+
+# Show current context
+$account = az account show --output json | ConvertFrom-Json
+Write-Host "Subscription: $($account.name) ($($account.id))" -ForegroundColor Cyan
+Write-Host ""
+
+# Get namespaces
+$nsArgs = @('servicebus', 'namespace', 'list', '--output', 'json')
+if ($ResourceGroup) {
+    $nsArgs += '--resource-group', $ResourceGroup
+}
+$namespaces = az @nsArgs | ConvertFrom-Json
+
+if (-not $namespaces -or $namespaces.Count -eq 0) {
+    Write-Warning "No Service Bus namespaces found."
+    return
+}
+
+$results = [System.Collections.Generic.List[PSObject]]::new()
+
+foreach ($ns in $namespaces) {
+    $nsName = $ns.name
+    $rg = $ns.resourceGroup
+    Write-Host "Scanning namespace: $nsName (RG: $rg)..." -ForegroundColor Yellow
+
+    # --- Queues ---
+    $queues = az servicebus queue list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-Json
+    foreach ($q in $queues) {
+        $dlqCount = $q.countDetails.deadLetterMessageCount
+        if ($dlqCount -ge $MinDlqCount) {
+            $results.Add([PSCustomObject]@{
+                Namespace    = $nsName
+                ResourceGroup = $rg
+                Type         = 'Queue'
+                Entity       = $q.name
+                Subscription = '-'
+                ActiveMessages = $q.countDetails.activeMessageCount
+                DLQMessages  = $dlqCount
+            })
+        }
+    }
+
+    # --- Topics & Subscriptions ---
+    $topics = az servicebus topic list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-Json
+    foreach ($t in $topics) {
+        $subs = az servicebus topic subscription list --namespace-name $nsName --resource-group $rg --topic-name $t.name --output json 2>$null | ConvertFrom-Json
+        foreach ($s in $subs) {
+            $dlqCount = $s.countDetails.deadLetterMessageCount
+            if ($dlqCount -ge $MinDlqCount) {
+                $results.Add([PSCustomObject]@{
+                    Namespace    = $nsName
+                    ResourceGroup = $rg
+                    Type         = 'Topic/Sub'
+                    Entity       = $t.name
+                    Subscription = $s.name
+                    ActiveMessages = $s.countDetails.activeMessageCount
+                    DLQMessages  = $dlqCount
+                })
+            }
+        }
+    }
+}
+
+Write-Host ""
+if ($results.Count -eq 0) {
+    Write-Host "No DLQ entries found (filter: MinDlqCount >= $MinDlqCount)." -ForegroundColor Green
+} else {
+    Write-Host "Results (MinDlqCount >= $MinDlqCount):" -ForegroundColor Cyan
+    $results | Sort-Object DLQMessages -Descending | Format-Table -AutoSize
+}
