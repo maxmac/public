@@ -1,95 +1,872 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Lists dead-letter queue (DLQ) message counts for all Service Bus queues and topic subscriptions
-    in the currently selected Azure subscription.
+    Interactive Service Bus message explorer — view, export, resubmit, and purge
+    messages from queues, topic subscriptions, and their dead-letter queues.
 .DESCRIPTION
-    Uses Az CLI with the current login context. Iterates over every Service Bus namespace found,
-    then queries queues and topic subscriptions for their DLQ message counts.
+    Uses Az CLI with the current login context.
+    All user preferences (filters, display options, feature toggles) are persisted
+    to a .settings.json file next to the script so they survive between runs.
+    Run the script and choose [S] Settings to configure.
 .EXAMPLE
     .\Get-ServiceBusDLQ.ps1
-    .\Get-ServiceBusDLQ.ps1 -ResourceGroup my-rg
-    .\Get-ServiceBusDLQ.ps1 -MinDlqCount 1
 #>
-param(
-    [string]$ResourceGroup,
-    [int]$MinDlqCount = 0
-)
 
-$ErrorActionPreference = 'Stop'
+# ── Settings ─────────────────────────────────────────────────────────────
+# Persisted to Get-ServiceBusDLQ.settings.json beside this script.
+# Editable via the [S] Settings menu at runtime.
 
-# Verify az cli is available
-if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-    Write-Error "Azure CLI (az) is not installed or not in PATH."
-    return
+$script:SettingsPath = Join-Path $PSScriptRoot 'Get-ServiceBusDLQ.settings.json'
+$script:LogPath      = Join-Path $PSScriptRoot 'Get-ServiceBusDLQ.log'
+
+$script:DefaultSettings = [ordered]@{
+    ResourceGroupFilter       = ''
+    NamespaceFilter           = ''
+    MinDlqCount               = 0
+    BodyPreviewMaxChars       = 500
+    EnableAuditLog            = $true
+    AutoExportBeforeDestructive = $true
 }
 
-# Show current context
-$account = az account show --output json | ConvertFrom-Json
-Write-Host "Subscription: $($account.name) ($($account.id))" -ForegroundColor Cyan
-Write-Host ""
-
-# Get namespaces
-$nsArgs = @('servicebus', 'namespace', 'list', '--output', 'json')
-if ($ResourceGroup) {
-    $nsArgs += '--resource-group', $ResourceGroup
-}
-$namespaces = az @nsArgs | ConvertFrom-Json
-
-if (-not $namespaces -or $namespaces.Count -eq 0) {
-    Write-Warning "No Service Bus namespaces found."
-    return
-}
-
-$results = [System.Collections.Generic.List[PSObject]]::new()
-
-foreach ($ns in $namespaces) {
-    $nsName = $ns.name
-    $rg = $ns.resourceGroup
-    Write-Host "Scanning namespace: $nsName (RG: $rg)..." -ForegroundColor Yellow
-
-    # --- Queues ---
-    $queues = az servicebus queue list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-Json
-    foreach ($q in $queues) {
-        $dlqCount = $q.countDetails.deadLetterMessageCount
-        if ($dlqCount -ge $MinDlqCount) {
-            $results.Add([PSCustomObject]@{
-                Namespace    = $nsName
-                ResourceGroup = $rg
-                Type         = 'Queue'
-                Entity       = $q.name
-                Subscription = '-'
-                ActiveMessages = $q.countDetails.activeMessageCount
-                DLQMessages  = $dlqCount
-            })
+function Load-Settings {
+    if (Test-Path $script:SettingsPath) {
+        try {
+            $json = Get-Content $script:SettingsPath -Raw | ConvertFrom-Json
+            $settings = [ordered]@{}
+            foreach ($key in $script:DefaultSettings.Keys) {
+                if ($null -ne $json.$key) { $settings[$key] = $json.$key }
+                else { $settings[$key] = $script:DefaultSettings[$key] }
+            }
+            return $settings
+        } catch {
+            Write-Warning "Could not load settings, using defaults."
         }
     }
+    return $script:DefaultSettings.Clone()
+}
 
-    # --- Topics & Subscriptions ---
-    $topics = az servicebus topic list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-Json
-    foreach ($t in $topics) {
-        $subs = az servicebus topic subscription list --namespace-name $nsName --resource-group $rg --topic-name $t.name --output json 2>$null | ConvertFrom-Json
-        foreach ($s in $subs) {
-            $dlqCount = $s.countDetails.deadLetterMessageCount
-            if ($dlqCount -ge $MinDlqCount) {
-                $results.Add([PSCustomObject]@{
-                    Namespace    = $nsName
-                    ResourceGroup = $rg
-                    Type         = 'Topic/Sub'
-                    Entity       = $t.name
-                    Subscription = $s.name
-                    ActiveMessages = $s.countDetails.activeMessageCount
-                    DLQMessages  = $dlqCount
-                })
+function Save-Settings {
+    param([ordered]$Settings)
+    $Settings | ConvertTo-Json -Depth 3 | Set-Content $script:SettingsPath -Encoding UTF8
+}
+
+function Show-SettingsMenu {
+    param([ordered]$Settings)
+    while ($true) {
+        Write-Host ""
+        Write-Host "  ── Settings ──" -ForegroundColor Cyan
+        Write-Host "  [1] Resource Group filter : $(if ($Settings.ResourceGroupFilter) { $Settings.ResourceGroupFilter } else { '(all)' })"
+        Write-Host "  [2] Namespace filter      : $(if ($Settings.NamespaceFilter) { $Settings.NamespaceFilter } else { '(all)' })"
+        Write-Host "  [3] Min DLQ count         : $($Settings.MinDlqCount)"
+        Write-Host "  [4] Body preview max chars : $($Settings.BodyPreviewMaxChars)"
+        Write-Host "  [5] Audit log             : $(if ($Settings.EnableAuditLog) { 'ON' } else { 'OFF' })"
+        Write-Host "  [6] Auto-export on delete/resubmit : $(if ($Settings.AutoExportBeforeDestructive) { 'ON' } else { 'OFF' })"
+        Write-Host "  [B] Back"
+        $c = Read-Host "  Option"
+        switch ($c) {
+            '1' {
+                $v = Read-Host "  Resource Group (blank = all)"
+                $Settings.ResourceGroupFilter = $v.Trim()
+            }
+            '2' {
+                $v = Read-Host "  Namespace contains (blank = all)"
+                $Settings.NamespaceFilter = $v.Trim()
+            }
+            '3' {
+                $v = Read-Host "  Minimum DLQ message count"
+                $parsed = 0
+                if ([int]::TryParse($v, [ref]$parsed)) { $Settings.MinDlqCount = $parsed }
+            }
+            '4' {
+                $v = Read-Host "  Max chars for body preview (0 = full)"
+                $parsed = 0
+                if ([int]::TryParse($v, [ref]$parsed)) { $Settings.BodyPreviewMaxChars = [Math]::Max(0, $parsed) }
+            }
+            '5' { $Settings.EnableAuditLog = -not $Settings.EnableAuditLog }
+            '6' { $Settings.AutoExportBeforeDestructive = -not $Settings.AutoExportBeforeDestructive }
+            { $_ -in @('B','b','') } {
+                Save-Settings $Settings
+                Write-Host "  Settings saved." -ForegroundColor Green
+                return
             }
         }
     }
 }
 
+# ── Audit Log ────────────────────────────────────────────────────────────
+
+function Write-AuditLog {
+    param([string]$Message)
+    if (-not $script:Settings.EnableAuditLog) { return }
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $user = "$env:USERNAME@$env:COMPUTERNAME"
+    "$ts | $user | $Message" | Out-File -Append -FilePath $script:LogPath -Encoding UTF8
+}
+
+# ── SAS Token ────────────────────────────────────────────────────────────
+
+function New-SasToken {
+    param(
+        [string]$ResourceUri,
+        [string]$KeyName,
+        [string]$Key,
+        [int]$ExpirySeconds = 3600
+    )
+    $expiry = [Math]::Floor(([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())) + $ExpirySeconds
+    $stringToSign = [System.Web.HttpUtility]::UrlEncode($ResourceUri) + "`n$expiry"
+    $hmac = $null
+    try {
+        $hmac = New-Object System.Security.Cryptography.HMACSHA256
+        $hmac.Key = [Text.Encoding]::UTF8.GetBytes($Key)
+        $sig = [Convert]::ToBase64String($hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($stringToSign)))
+    } finally {
+        if ($hmac) { $hmac.Dispose() }
+    }
+    return "SharedAccessSignature sr=$([System.Web.HttpUtility]::UrlEncode($ResourceUri))&sig=$([System.Web.HttpUtility]::UrlEncode($sig))&se=$expiry&skn=$KeyName"
+}
+
+# Wraps key info + auto-refreshes the token when it's close to expiry.
+function Get-SasTokenCached {
+    param([string]$BaseUri, [hashtable]$Keys)
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if (-not $script:SasCache."$BaseUri" -or ($script:SasCache."$BaseUri".Expiry - $now) -lt 300) {
+        $token = New-SasToken -ResourceUri $BaseUri -KeyName $Keys.KeyName -Key $Keys.PrimaryKey
+        $script:SasCache."$BaseUri" = @{ Token = $token; Expiry = $now + 3600 }
+    }
+    return $script:SasCache."$BaseUri".Token
+}
+
+# ── Namespace Keys ───────────────────────────────────────────────────────
+
+function Get-NamespaceKeys {
+    param([string]$Namespace, [string]$Rg)
+    $rules = az servicebus namespace authorization-rule list `
+        --namespace-name $Namespace --resource-group $Rg --output json | ConvertFrom-Json
+    $rule = $rules |
+        Where-Object { $_.rights -contains 'Send' -and $_.rights -contains 'Listen' } |
+        Select-Object -First 1
+    if (-not $rule) { $rule = $rules | Select-Object -First 1 }
+    $keys = az servicebus namespace authorization-rule keys list `
+        --namespace-name $Namespace --resource-group $Rg --name $rule.name --output json | ConvertFrom-Json
+    return @{ KeyName = $rule.name; PrimaryKey = $keys.primaryKey }
+}
+
+# ── Entity Path Builders ─────────────────────────────────────────────────
+
+function Get-EntityPath {
+    param([PSObject]$Entry, [bool]$IsDlq)
+    $path = if ($Entry.Type -eq 'Queue') { $Entry.Entity }
+            else { "$($Entry.Entity)/Subscriptions/$($Entry.Subscription)" }
+    if ($IsDlq) { $path += '/`$deadletterqueue' }
+    return $path
+}
+
+# ── REST Message Operations ──────────────────────────────────────────────
+
+function Parse-MessageResponse {
+    param($Response, [switch]$IncludeLockUri)
+    $brokerProps = $null
+    if ($Response.Headers['BrokerProperties']) {
+        $brokerProps = $Response.Headers['BrokerProperties'] | ConvertFrom-Json
+    }
+    $customProps = @{}
+    $skipHeaders = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase)
+    @('BrokerProperties','Content-Type','Content-Length','Server','Transfer-Encoding',
+      'Date','Strict-Transport-Security','Connection') | ForEach-Object { $skipHeaders.Add($_) | Out-Null }
+    foreach ($h in $Response.Headers.Keys) {
+        if (-not $skipHeaders.Contains($h) -and $h -notlike 'x-ms-*') {
+            $customProps[$h] = $Response.Headers[$h]
+        }
+    }
+    $result = @{
+        Body             = $Response.Content
+        BrokerProperties = $brokerProps
+        CustomProperties = $customProps
+        ContentType      = $Response.Headers['Content-Type']
+        StatusCode       = $Response.StatusCode
+    }
+    if ($IncludeLockUri -and $Response.Headers['Location']) {
+        $result.LockUri = $Response.Headers['Location']
+    }
+    return $result
+}
+
+function Invoke-PeekLock {
+    param([string]$BaseUri, [string]$EntityPath, [string]$SasToken)
+    $uri = "$BaseUri/$EntityPath/messages/head?timeout=5&api-version=2015-01"
+    try {
+        $response = Invoke-WebRequest -Uri $uri -Method Post `
+            -Headers @{ Authorization = $SasToken } -UseBasicParsing -ErrorAction Stop
+        return (Parse-MessageResponse -Response $response -IncludeLockUri)
+    } catch {
+        if ($_.Exception.Response.StatusCode.value__ -eq 204) { return $null }
+        throw
+    }
+}
+
+function Invoke-ReceiveAndDelete {
+    param([string]$BaseUri, [string]$EntityPath, [string]$SasToken)
+    $uri = "$BaseUri/$EntityPath/messages/head?timeout=5&api-version=2015-01"
+    try {
+        $response = Invoke-WebRequest -Uri $uri -Method Delete `
+            -Headers @{ Authorization = $SasToken } -UseBasicParsing -ErrorAction Stop
+        return (Parse-MessageResponse -Response $response)
+    } catch {
+        if ($_.Exception.Response.StatusCode.value__ -eq 204) { return $null }
+        throw
+    }
+}
+
+function Unlock-Message {
+    param([string]$LockUri, [string]$SasToken)
+    Invoke-WebRequest -Uri $LockUri -Method Put `
+        -Headers @{ Authorization = $SasToken } -UseBasicParsing | Out-Null
+}
+
+function Send-Message {
+    param([string]$BaseUri, [string]$SendPath, [string]$SasToken, [hashtable]$Message)
+    $uri = "$BaseUri/$SendPath/messages?api-version=2015-01"
+    $headers = @{ Authorization = $SasToken }
+    if ($Message.BrokerProperties) {
+        $fwdProps = @{}
+        foreach ($p in @('MessageId','Label','SessionId','CorrelationId','To','ReplyTo',
+                         'ReplyToSessionId','PartitionKey','ContentType','TimeToLive')) {
+            $val = $Message.BrokerProperties.$p
+            if ($null -ne $val -and $val -ne '') { $fwdProps[$p] = $val }
+        }
+        if ($fwdProps.Count -gt 0) {
+            $headers['BrokerProperties'] = ($fwdProps | ConvertTo-Json -Compress)
+        }
+    }
+    foreach ($k in $Message.CustomProperties.Keys) { $headers[$k] = $Message.CustomProperties[$k] }
+    $ct = if ($Message.ContentType) { $Message.ContentType } else { 'application/json' }
+    Invoke-WebRequest -Uri $uri -Method Post -Headers $headers `
+        -Body $Message.Body -ContentType $ct -UseBasicParsing | Out-Null
+}
+
+# ── Excel ────────────────────────────────────────────────────────────────
+
+function ConvertTo-ExcelRow {
+    param([hashtable]$Message, [int]$Index)
+    $bp = $Message.BrokerProperties
+    [PSCustomObject]@{
+        '#'                        = $Index
+        MessageId                  = $bp.MessageId
+        SequenceNumber             = $bp.SequenceNumber
+        EnqueuedTimeUtc            = $bp.EnqueuedTimeUtc
+        ExpiresAtUtc               = $bp.ExpiresAtUtc
+        DeadLetterReason           = $bp.DeadLetterReason
+        DeadLetterErrorDescription = $bp.DeadLetterErrorDescription
+        Label                      = $bp.Label
+        ContentType                = $Message.ContentType
+        CorrelationId              = $bp.CorrelationId
+        SessionId                  = $bp.SessionId
+        DeliveryCount              = $bp.DeliveryCount
+        Size                       = $bp.Size
+        State                      = $bp.State
+        CustomProperties           = ($Message.CustomProperties | ConvertTo-Json -Compress -Depth 3)
+        Body                       = $Message.Body
+    }
+}
+
+function Assert-ImportExcel {
+    if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+        Write-Host "  The 'ImportExcel' module is required for Excel export." -ForegroundColor Yellow
+        $install = Read-Host "  Install it now? (Y/N)"
+        if ($install -in @('Y','y')) {
+            Install-Module ImportExcel -Scope CurrentUser -Force
+            Import-Module ImportExcel
+        } else { return $false }
+    } else {
+        Import-Module ImportExcel
+    }
+    return $true
+}
+
+function Export-MessagesToExcel {
+    param(
+        [System.Collections.Generic.List[PSObject]]$Rows,
+        [PSObject]$Entry,
+        [string]$Source
+    )
+    $safe = { param($s) $s -replace '[\\/:*?"<>|]', '_' }
+    $ts   = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $name = if ($Entry.Type -eq 'Queue') {
+        "${Source}_$(& $safe $Entry.Entity)_$ts.xlsx"
+    } else {
+        "${Source}_$(& $safe $Entry.Entity)_$(& $safe $Entry.Subscription)_$ts.xlsx"
+    }
+    $path = Join-Path (Get-Location) $name
+    $Rows | Export-Excel -Path $path -AutoSize -FreezeTopRow -BoldTopRow `
+        -WorksheetName "${Source}Messages" -TableName "${Source}Messages" -TableStyle Medium2
+    return $path
+}
+
+# ── Progress ─────────────────────────────────────────────────────────────
+
+function Update-ProgressBar {
+    param([int]$Current, [int]$Total, [string]$Activity, [System.Diagnostics.Stopwatch]$Timer)
+    $pct = if ($Total -gt 0) { [Math]::Min(100, [Math]::Floor(($Current / $Total) * 100)) } else { 0 }
+    $elapsed = $Timer.Elapsed
+    $rate = if ($elapsed.TotalSeconds -gt 1) { [Math]::Round($Current / $elapsed.TotalSeconds, 1) } else { 0 }
+    $eta = if ($rate -gt 0) {
+        $secs = [Math]::Ceiling(($Total - $Current) / $rate)
+        if ($secs -ge 60) { "$([Math]::Floor($secs/60))m $($secs%60)s" } else { "${secs}s" }
+    } else { 'calculating...' }
+    $status = "$Current / $Total  |  ${rate} msg/s  |  ETA: $eta"
+    Write-Progress -Activity $Activity -Status $status -PercentComplete $pct
+}
+
+function Should-ReportProgress {
+    param([int]$Current, [int]$Total)
+    if ($Total -le 50)   { return $true }
+    if ($Total -le 500)  { return ($Current % 10 -eq 0) }
+    if ($Total -le 5000) { return ($Current % 100 -eq 0) }
+    return ($Current % 500 -eq 0)
+}
+
+# ── Scanning ─────────────────────────────────────────────────────────────
+
+function Invoke-Scan {
+    param([ordered]$Settings)
+    $nsArgs = @('servicebus', 'namespace', 'list', '--output', 'json')
+    if ($Settings.ResourceGroupFilter) {
+        $nsArgs += '--resource-group', $Settings.ResourceGroupFilter
+    }
+    $namespaces = az @nsArgs | ConvertFrom-Json
+
+    if ($Settings.NamespaceFilter) {
+        $namespaces = $namespaces | Where-Object { $_.name -like "*$($Settings.NamespaceFilter)*" }
+    }
+
+    if (-not $namespaces -or @($namespaces).Count -eq 0) {
+        Write-Warning "No Service Bus namespaces found matching filters."
+        return $null
+    }
+
+    $results = [System.Collections.Generic.List[PSObject]]::new()
+    $totalDlq = 0
+
+    foreach ($ns in $namespaces) {
+        $nsName = $ns.name
+        $rg = $ns.resourceGroup
+        Write-Host "  Scanning $nsName..." -ForegroundColor DarkGray
+
+        $queues = az servicebus queue list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-Json
+        foreach ($q in $queues) {
+            $dlq    = [int]$q.countDetails.deadLetterMessageCount
+            $active = [int]$q.countDetails.activeMessageCount
+            if ($dlq -ge $Settings.MinDlqCount) {
+                $results.Add([PSCustomObject]@{
+                    Index          = $results.Count + 1
+                    Namespace      = $nsName
+                    ResourceGroup  = $rg
+                    Type           = 'Queue'
+                    Entity         = $q.name
+                    Subscription   = '-'
+                    ActiveMessages = $active
+                    DLQMessages    = $dlq
+                })
+                $totalDlq += $dlq
+            }
+        }
+
+        $topics = az servicebus topic list --namespace-name $nsName --resource-group $rg --output json 2>$null | ConvertFrom-Json
+        foreach ($t in $topics) {
+            $subs = az servicebus topic subscription list --namespace-name $nsName --resource-group $rg --topic-name $t.name --output json 2>$null | ConvertFrom-Json
+            foreach ($s in $subs) {
+                $dlq    = [int]$s.countDetails.deadLetterMessageCount
+                $active = [int]$s.countDetails.activeMessageCount
+                if ($dlq -ge $Settings.MinDlqCount) {
+                    $results.Add([PSCustomObject]@{
+                        Index          = $results.Count + 1
+                        Namespace      = $nsName
+                        ResourceGroup  = $rg
+                        Type           = 'Topic/Sub'
+                        Entity         = $t.name
+                        Subscription   = $s.name
+                        ActiveMessages = $active
+                        DLQMessages    = $dlq
+                    })
+                    $totalDlq += $dlq
+                }
+            }
+        }
+    }
+
+    # Summary banner
+    $nsCount  = @($namespaces).Count
+    $dlqRows  = @($results | Where-Object { $_.DLQMessages -gt 0 }).Count
+    Write-Host ""
+    Write-Host "  Found $($results.Count) entities across $nsCount namespace(s)" -NoNewline -ForegroundColor Cyan
+    if ($dlqRows -gt 0) {
+        Write-Host " — $dlqRows with DLQ messages ($totalDlq total dead-lettered)" -ForegroundColor Yellow
+    } else {
+        Write-Host " — no dead-lettered messages" -ForegroundColor Green
+    }
+
+    return $results
+}
+
+# ── Display Helpers ──────────────────────────────────────────────────────
+
+function Show-ResultsTable {
+    param($Results)
+    if (-not $Results -or $Results.Count -eq 0) { return }
+    Write-Host ""
+
+    # Colorized table: highlight rows with DLQ > 0
+    $fmt = "{0,5} {1,-30} {2,-10} {3,-30} {4,-20} {5,8} {6,8}"
+    Write-Host ($fmt -f 'Index','Namespace','Type','Entity','Subscription','Active','DLQ') -ForegroundColor White
+    Write-Host ($fmt -f '-----','─────────','────','──────','────────────','──────','───') -ForegroundColor DarkGray
+    foreach ($r in ($Results | Sort-Object DLQMessages -Descending)) {
+        $color = if ($r.DLQMessages -gt 0) { 'Yellow' } else { 'Gray' }
+        Write-Host ($fmt -f $r.Index, $r.Namespace, $r.Type, $r.Entity, $r.Subscription, $r.ActiveMessages, $r.DLQMessages) -ForegroundColor $color
+    }
+}
+
+function Format-BodyPreview {
+    param([string]$Body, [int]$MaxChars)
+    if ($MaxChars -le 0 -or $Body.Length -le $MaxChars) { return $Body }
+    return $Body.Substring(0, $MaxChars) + " ... [truncated, $($Body.Length) chars total]"
+}
+
+# ── Peek with duplicate detection (handles lock expiry at scale) ─────────
+
+function Invoke-SafePeekAll {
+    param(
+        [string]$BaseUri,
+        [string]$EntityPath,
+        [string]$SasToken,
+        [int]$ExpectedCount,
+        [scriptblock]$OnMessage,     # receives ($msg, $index)
+        [string]$ActivityLabel
+    )
+    $seen = [System.Collections.Generic.HashSet[long]]::new()
+    $duplicatesInARow = 0
+    $maxDuplicates = [Math]::Max(10, [Math]::Ceiling($ExpectedCount * 0.1))
+    $errors = 0
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $maxAttempts = $ExpectedCount * 3 + 20  # safety ceiling
+
+    for ($attempt = 0; $attempt -lt $maxAttempts; $attempt++) {
+        $sasToken = Get-SasTokenCached -BaseUri $BaseUri -Keys $script:CurrentKeys
+
+        try {
+            $msg = Invoke-PeekLock -BaseUri $BaseUri -EntityPath $EntityPath -SasToken $sasToken
+        } catch {
+            $errors++
+            if ($errors -ge 10) {
+                Write-Warning "`n  Too many errors, stopping."
+                break
+            }
+            continue
+        }
+
+        if (-not $msg) { break }
+
+        $seq = $msg.BrokerProperties.SequenceNumber
+        if ($seq -and -not $seen.Add($seq)) {
+            # Duplicate — lock expired and we re-peeked a message we already saw
+            $duplicatesInARow++
+            if ($msg.LockUri) { Unlock-Message -LockUri $msg.LockUri -SasToken $sasToken }
+            if ($duplicatesInARow -ge $maxDuplicates) {
+                Write-Host "`n  Reached end (detected $duplicatesInARow re-locked duplicates)." -ForegroundColor DarkGray
+                break
+            }
+            continue
+        }
+
+        $duplicatesInARow = 0
+        $index = $seen.Count
+
+        # Release lock immediately so we don't starve consumers
+        if ($msg.LockUri) {
+            Unlock-Message -LockUri $msg.LockUri -SasToken $sasToken
+        }
+
+        & $OnMessage $msg $index
+
+        if (Should-ReportProgress -Current $index -Total $ExpectedCount) {
+            Update-ProgressBar -Current $index -Total $ExpectedCount -Activity $ActivityLabel -Timer $sw
+        }
+
+        if ($index -ge $ExpectedCount) { break }
+    }
+
+    Write-Progress -Activity $ActivityLabel -Completed
+    return $seen.Count
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── MAIN ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+$oldErrorPref = $ErrorActionPreference
+$ErrorActionPreference = 'Stop'
+
+try {
+
+Add-Type -AssemblyName System.Web
+
+if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+    Write-Error "Azure CLI (az) is not installed or not in PATH."
+    return
+}
+
+# ── Load settings ──
+$script:Settings = Load-Settings
+$script:SasCache = @{}
+
+# ── Subscription selection ──
+$subscriptions = az account list --output json --query "[?state=='Enabled']" | ConvertFrom-Json
+if (-not $subscriptions -or $subscriptions.Count -eq 0) {
+    Write-Error "No enabled Azure subscriptions found. Run 'az login' first."
+    return
+}
+
+$current = az account show --output json | ConvertFrom-Json
 Write-Host ""
-if ($results.Count -eq 0) {
-    Write-Host "No DLQ entries found (filter: MinDlqCount >= $MinDlqCount)." -ForegroundColor Green
-} else {
-    Write-Host "Results (MinDlqCount >= $MinDlqCount):" -ForegroundColor Cyan
-    $results | Sort-Object DLQMessages -Descending | Format-Table -AutoSize
+Write-Host "  Azure Subscriptions:" -ForegroundColor Cyan
+Write-Host ""
+for ($i = 0; $i -lt $subscriptions.Count; $i++) {
+    $sub = $subscriptions[$i]
+    $marker = if ($sub.id -eq $current.id) { ' *' } else { '' }
+    $color  = if ($sub.id -eq $current.id) { 'Green' } else { 'White' }
+    Write-Host "  [$($i+1)] $($sub.name)$marker" -ForegroundColor $color
+    Write-Host "       $($sub.id)" -ForegroundColor DarkGray
+}
+Write-Host ""
+$subChoice = Read-Host "  Select subscription (Enter = keep current)"
+
+if ($subChoice -ne '') {
+    $subIdx = 0
+    if ([int]::TryParse($subChoice, [ref]$subIdx) -and $subIdx -ge 1 -and $subIdx -le $subscriptions.Count) {
+        $selected = $subscriptions[$subIdx - 1]
+        if ($selected.id -ne $current.id) {
+            Write-Host "  Switching to $($selected.name)..." -ForegroundColor Yellow
+            az account set --subscription $selected.id | Out-Null
+            $current = az account show --output json | ConvertFrom-Json
+        }
+    } else {
+        Write-Warning "  Invalid selection, keeping current."
+    }
+}
+
+Write-Host ""
+Write-Host "  Subscription: $($current.name)" -ForegroundColor Cyan
+Write-Host "  $($current.id)" -ForegroundColor DarkGray
+Write-AuditLog "Session started — subscription: $($current.name) ($($current.id))"
+
+# ── Initial scan ──
+Write-Host ""
+$results = Invoke-Scan -Settings $script:Settings
+if (-not $results) { return }
+Show-ResultsTable $results
+
+# ── Key cache ──
+$keyCache = @{}
+
+# ── Interactive loop ─────────────────────────────────────────────────────
+
+while ($true) {
+    Write-Host ""
+    Write-Host "  Enter row number | 'all' to batch-export | [S]ettings | [R]efresh | [Q]uit" -ForegroundColor DarkGray
+    $input_ = Read-Host "  >"
+
+    # ── Quit ──
+    if ($input_ -in @('q','Q')) {
+        Write-AuditLog "Session ended."
+        break
+    }
+
+    # ── Settings ──
+    if ($input_ -in @('s','S')) {
+        Show-SettingsMenu $script:Settings
+        Write-Host "  Rescanning with new filters..." -ForegroundColor Yellow
+        $results = Invoke-Scan -Settings $script:Settings
+        if ($results) { Show-ResultsTable $results }
+        continue
+    }
+
+    # ── Refresh ──
+    if ($input_ -in @('r','R')) {
+        Write-Host "  Rescanning..." -ForegroundColor Yellow
+        $results = Invoke-Scan -Settings $script:Settings
+        if ($results) { Show-ResultsTable $results }
+        continue
+    }
+
+    # ── Batch export all DLQs ──
+    if ($input_ -in @('all','ALL','All')) {
+        if (-not (Assert-ImportExcel)) {
+            Write-Warning "  ImportExcel required for batch export."
+            continue
+        }
+        $dlqEntries = @($results | Where-Object { $_.DLQMessages -gt 0 })
+        if ($dlqEntries.Count -eq 0) {
+            Write-Host "  No DLQ messages to export." -ForegroundColor DarkGray
+            continue
+        }
+        Write-Host "  Exporting DLQ messages for $($dlqEntries.Count) entities..." -ForegroundColor Cyan
+        foreach ($entry in $dlqEntries) {
+            $nsKey = $entry.Namespace
+            if (-not $keyCache.ContainsKey($nsKey)) {
+                $keyCache[$nsKey] = Get-NamespaceKeys -Namespace $entry.Namespace -Rg $entry.ResourceGroup
+            }
+            $script:CurrentKeys = $keyCache[$nsKey]
+            $baseUri    = "https://$($entry.Namespace).servicebus.windows.net"
+            $entityPath = Get-EntityPath -Entry $entry -IsDlq $true
+
+            $rows = [System.Collections.Generic.List[PSObject]]::new()
+            $desc = if ($entry.Type -eq 'Queue') { $entry.Entity } else { "$($entry.Entity)/$($entry.Subscription)" }
+            Write-Host "  $desc ($($entry.DLQMessages) DLQ)..." -ForegroundColor DarkGray
+
+            $sasToken = Get-SasTokenCached -BaseUri $baseUri -Keys $script:CurrentKeys
+            $null = Invoke-SafePeekAll -BaseUri $baseUri -EntityPath $entityPath -SasToken $sasToken `
+                -ExpectedCount $entry.DLQMessages -ActivityLabel "Exporting $desc DLQ" -OnMessage {
+                    param($m, $i)
+                    $rows.Add((ConvertTo-ExcelRow -Message $m -Index $i))
+                }
+
+            if ($rows.Count -gt 0) {
+                $fp = Export-MessagesToExcel -Rows $rows -Entry $entry -Source 'DLQ'
+                Write-Host "    -> $fp ($($rows.Count) messages)" -ForegroundColor Green
+                Write-AuditLog "Batch export: $desc DLQ — $($rows.Count) messages -> $fp"
+            }
+        }
+        continue
+    }
+
+    # ── Single row selection ──
+    $idx = 0
+    if (-not [int]::TryParse($input_, [ref]$idx)) {
+        Write-Warning "  Invalid input."
+        continue
+    }
+    $entry = $results | Where-Object { $_.Index -eq $idx }
+    if (-not $entry) {
+        Write-Warning "  Row $idx not found."
+        continue
+    }
+
+    $desc = if ($entry.Type -eq 'Queue') { "Queue: $($entry.Entity)" }
+            else { "Topic: $($entry.Entity) / Sub: $($entry.Subscription)" }
+    Write-Host ""
+    Write-Host "  $desc" -ForegroundColor Cyan
+    Write-Host "  Active: $($entry.ActiveMessages)  |  DLQ: $($entry.DLQMessages)" -ForegroundColor Cyan
+
+    # ── Choose target ──
+    Write-Host ""
+    Write-Host "  [1] Dead-letter queue ($($entry.DLQMessages) messages)"
+    Write-Host "  [2] Active queue ($($entry.ActiveMessages) messages)"
+    $targetChoice = Read-Host "  Target"
+    $isDlq = $true
+    $messageCount = $entry.DLQMessages
+    $sourceLabel = 'DLQ'
+    if ($targetChoice -eq '2') {
+        $isDlq = $false
+        $messageCount = $entry.ActiveMessages
+        $sourceLabel = 'Active'
+        if ($messageCount -gt 0) {
+            Write-Host "  WARNING: Peek-locking active messages makes them temporarily invisible to real consumers." -ForegroundColor Yellow
+        }
+    } elseif ($targetChoice -ne '1') {
+        continue
+    }
+
+    if ($messageCount -eq 0) {
+        Write-Host "  No messages in $sourceLabel queue." -ForegroundColor DarkGray
+        continue
+    }
+
+    # ── Choose action ──
+    Write-Host ""
+    Write-Host "  [P] Peek messages in console"
+    Write-Host "  [E] Export to Excel (non-destructive)"
+    if ($isDlq) {
+        Write-Host "  [R] Resubmit back to entity (saves backup first)"
+    }
+    Write-Host "  [D] Delete / purge (saves backup first)"
+    Write-Host "  [S] Skip"
+    $action = Read-Host "  Action"
+
+    $validActions = @('P','p','E','e','D','d')
+    if ($isDlq) { $validActions += @('R','r') }
+    if ($action -notin $validActions) { continue }
+
+    # ── Resolve keys + token ──
+    $nsKey = $entry.Namespace
+    if (-not $keyCache.ContainsKey($nsKey)) {
+        Write-Host "  Fetching access keys..." -ForegroundColor DarkGray
+        $keyCache[$nsKey] = Get-NamespaceKeys -Namespace $entry.Namespace -Rg $entry.ResourceGroup
+    }
+    $script:CurrentKeys = $keyCache[$nsKey]
+    $baseUri    = "https://$($entry.Namespace).servicebus.windows.net"
+    $entityPath = Get-EntityPath -Entry $entry -IsDlq $isDlq
+    $total      = $messageCount
+
+    # ── PEEK ─────────────────────────────────────────────────────────────
+    if ($action -in @('P','p')) {
+        $maxChars = $script:Settings.BodyPreviewMaxChars
+        Write-Host "  Peeking $total $sourceLabel message(s)..." -ForegroundColor DarkGray
+
+        $peeked = Invoke-SafePeekAll -BaseUri $baseUri -EntityPath $entityPath `
+            -SasToken (Get-SasTokenCached -BaseUri $baseUri -Keys $script:CurrentKeys) `
+            -ExpectedCount $total -ActivityLabel "Peeking $sourceLabel" -OnMessage {
+                param($m, $i)
+                Write-Host "`n  ── Message $i / $total ──" -ForegroundColor DarkYellow
+                if ($m.BrokerProperties) {
+                    $bp = $m.BrokerProperties
+                    Write-Host "  MessageId : $($bp.MessageId)" -ForegroundColor Gray
+                    Write-Host "  Seq       : $($bp.SequenceNumber)  Enqueued: $($bp.EnqueuedTimeUtc)" -ForegroundColor Gray
+                    if ($isDlq -and $bp.DeadLetterReason) {
+                        Write-Host "  DLQ Reason: $($bp.DeadLetterReason)" -ForegroundColor Red
+                        Write-Host "  DLQ Error : $($bp.DeadLetterErrorDescription)" -ForegroundColor Red
+                    }
+                }
+                $preview = Format-BodyPreview -Body $m.Body -MaxChars $maxChars
+                Write-Host $preview
+            }
+
+        Write-Host "`n  Peeked $peeked message(s)." -ForegroundColor Green
+        continue
+    }
+
+    # ── EXPORT ───────────────────────────────────────────────────────────
+    if ($action -in @('E','e')) {
+        if (-not (Assert-ImportExcel)) {
+            Write-Warning "  Export cancelled."
+            continue
+        }
+        $rows = [System.Collections.Generic.List[PSObject]]::new()
+        Write-Host "  Exporting $total $sourceLabel message(s)..." -ForegroundColor DarkGray
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+        $null = Invoke-SafePeekAll -BaseUri $baseUri -EntityPath $entityPath `
+            -SasToken (Get-SasTokenCached -BaseUri $baseUri -Keys $script:CurrentKeys) `
+            -ExpectedCount $total -ActivityLabel "Exporting $sourceLabel" -OnMessage {
+                param($m, $i)
+                $rows.Add((ConvertTo-ExcelRow -Message $m -Index $i))
+            }
+
+        if ($rows.Count -gt 0) {
+            $fp = Export-MessagesToExcel -Rows $rows -Entry $entry -Source $sourceLabel
+            $el = $sw.Elapsed.ToString('mm\:ss')
+            Write-Host "  Exported $($rows.Count) messages in $el to: $fp" -ForegroundColor Green
+            Write-AuditLog "Export: $desc $sourceLabel — $($rows.Count) messages -> $fp"
+        } else {
+            Write-Warning "  No messages exported."
+        }
+        continue
+    }
+
+    # ── RESUBMIT / DELETE ────────────────────────────────────────────────
+    $hasExcel = $false
+    if ($script:Settings.AutoExportBeforeDestructive) {
+        if (Assert-ImportExcel) { $hasExcel = $true }
+        else {
+            Write-Warning "  ImportExcel not available — no backup will be saved."
+            $skip = Read-Host "  Continue without backup? (Y/N)"
+            if ($skip -notin @('Y','y')) {
+                Write-Host "  Cancelled." -ForegroundColor DarkGray
+                continue
+            }
+        }
+    }
+
+    # Preview first 3 messages before destructive action
+    Write-Host ""
+    Write-Host "  Preview of first messages to be affected:" -ForegroundColor Yellow
+    $previewCount = [Math]::Min(3, $total)
+    $previewMsgs = [System.Collections.Generic.List[hashtable]]::new()
+    for ($p = 0; $p -lt $previewCount; $p++) {
+        $sasToken = Get-SasTokenCached -BaseUri $baseUri -Keys $script:CurrentKeys
+        $pmsg = Invoke-PeekLock -BaseUri $baseUri -EntityPath $entityPath -SasToken $sasToken
+        if (-not $pmsg) { break }
+        $previewMsgs.Add($pmsg)
+        $preview = Format-BodyPreview -Body $pmsg.Body -MaxChars 200
+        Write-Host "    $($p+1). [$($pmsg.BrokerProperties.MessageId)] $preview" -ForegroundColor DarkYellow
+        if ($pmsg.LockUri) { Unlock-Message -LockUri $pmsg.LockUri -SasToken $sasToken }
+    }
+
+    $verbDisplay = if ($action -in @('R','r')) { 'Resubmit' } else { 'PERMANENTLY DELETE' }
+    Write-Host ""
+    Write-Host "  $verbDisplay ALL $total $sourceLabel messages from [$desc]?" -ForegroundColor Red
+    $confirm = Read-Host "  Type YES to confirm"
+    if ($confirm -ne 'YES') {
+        Write-Host "  Cancelled." -ForegroundColor DarkGray
+        continue
+    }
+
+    $processed  = 0
+    $errors     = 0
+    $maxMsgs    = $total + [Math]::Max(5, [Math]::Ceiling($total * 0.2))
+    $excelRows  = [System.Collections.Generic.List[PSObject]]::new()
+    $sw         = [System.Diagnostics.Stopwatch]::StartNew()
+
+    Write-AuditLog "BEGIN $verbDisplay : $desc $sourceLabel — $total messages"
+
+    for ($i = 0; $i -lt $maxMsgs; $i++) {
+        $sasToken = Get-SasTokenCached -BaseUri $baseUri -Keys $script:CurrentKeys
+
+        try {
+            $msg = Invoke-ReceiveAndDelete -BaseUri $baseUri -EntityPath $entityPath -SasToken $sasToken
+        } catch {
+            $errors++
+            if ($errors -ge 10) {
+                Write-Warning "`n  Too many consecutive errors, stopping."
+                break
+            }
+            continue
+        }
+
+        if (-not $msg) {
+            Write-Host ""
+            break
+        }
+
+        if ($hasExcel) {
+            $excelRows.Add((ConvertTo-ExcelRow -Message $msg -Index ($processed + 1)))
+        }
+
+        if ($action -in @('R','r')) {
+            try {
+                Send-Message -BaseUri $baseUri -SendPath $entry.Entity -SasToken $sasToken -Message $msg
+            } catch {
+                $errors++
+                if ($errors -ge 10) {
+                    Write-Warning "`n  Too many send errors, stopping."
+                    break
+                }
+                continue
+            }
+        }
+
+        $processed++
+        $errors = 0
+        if (Should-ReportProgress -Current $processed -Total $total) {
+            Update-ProgressBar -Current $processed -Total $total `
+                -Activity "$verbDisplay $sourceLabel" -Timer $sw
+        }
+    }
+    Write-Progress -Activity "$verbDisplay $sourceLabel" -Completed
+
+    if ($hasExcel -and $excelRows.Count -gt 0) {
+        $fp = Export-MessagesToExcel -Rows $excelRows -Entry $entry -Source $sourceLabel
+        Write-Host "  Backup saved: $fp" -ForegroundColor Green
+        Write-AuditLog "Backup saved: $fp ($($excelRows.Count) messages)"
+    }
+
+    $verbPast = if ($action -in @('R','r')) { 'resubmitted' } else { 'deleted' }
+    $el = $sw.Elapsed.ToString('mm\:ss')
+    Write-Host "  Done: $processed messages $verbPast in $el." -ForegroundColor Green
+    Write-AuditLog "END $verbDisplay : $desc $sourceLabel — $processed $verbPast, $errors errors"
+}
+
+Write-Host "Bye!" -ForegroundColor Cyan
+
+} finally {
+    $ErrorActionPreference = $oldErrorPref
 }
